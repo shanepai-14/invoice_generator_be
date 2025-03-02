@@ -93,16 +93,106 @@ class InvoiceController extends Controller
         return response()->json($invoice->load(['customer', 'items.product', 'payments']));
     }
 
-    public function update(Request $request, Invoice $invoice): JsonResponse
-    {
-        $validated = $request->validate([
-            'invoice_status' => 'sometimes|in:draft,sent,paid,partially_paid,overdue',
-            'due_date' => 'sometimes|date'
-        ]);
+    // public function update(Request $request, Invoice $invoice): JsonResponse
+    // {
+    //     $validated = $request->validate([
+    //         'invoice_status' => 'sometimes|in:draft,sent,paid,partially_paid,overdue',
+    //         'due_date' => 'sometimes|date'
+    //     ]);
 
+    //     $invoice->update($validated);
+    //     return response()->json($invoice);
+    // }
+
+    public function update(Request $request, Invoice $invoice): JsonResponse
+{
+    $validated = $request->validate([
+        'invoice_status' => 'sometimes|in:draft,sent,paid,partially_paid,overdue',
+        'due_date' => 'sometimes|date',
+        'customer_id' => 'sometimes|exists:customers,id',
+        'items' => 'sometimes|array'
+    ]);
+
+    // If items are being updated
+    if (isset($validated['items'])) {
+        return \DB::transaction(function () use ($request, $invoice, $validated) {
+            // Validate all items
+            $request->validate([
+                'items.*.product_id' => 'required|exists:products,id',
+                'items.*.quantity' => 'required|integer|min:1',
+                'items.*.id' => 'sometimes|exists:invoice_items,id'
+            ]);
+
+            // Get current item IDs
+            $currentItemIds = $invoice->items->pluck('id')->toArray();
+            
+            // Track which items have been processed
+            $processedItemIds = [];
+            
+            $totalAmount = 0;
+
+            // Update or create items
+            foreach ($validated['items'] as $itemData) {
+                $product = Product::find($itemData['product_id']);
+                $itemTotal = $product->price * $itemData['quantity'];
+                $totalAmount += $itemTotal;
+
+                if (isset($itemData['id'])) {
+                    // Update existing item
+                    $item = InvoiceItem::find($itemData['id']);
+                    if ($item && $item->invoice_id == $invoice->id) {
+                        $item->update([
+                            'product_id' => $itemData['product_id'],
+                            'quantity' => $itemData['quantity'],
+                            'total' => $itemTotal
+                        ]);
+                        $processedItemIds[] = $item->id;
+                    }
+                } else {
+                    // Create new item
+                    $item = InvoiceItem::create([
+                        'invoice_id' => $invoice->id,
+                        'product_id' => $itemData['product_id'],
+                        'quantity' => $itemData['quantity'],
+                        'total' => $itemTotal
+                    ]);
+                    $processedItemIds[] = $item->id;
+                }
+            }
+
+            // Delete items that weren't in the request
+            $itemsToDelete = array_diff($currentItemIds, $processedItemIds);
+            InvoiceItem::whereIn('id', $itemsToDelete)->delete();
+
+            // Update invoice data
+            $invoice->update([
+                'total_amount' => $totalAmount,
+                'outstanding_balance' => $totalAmount - $invoice->total_paid
+            ]);
+
+            // Update other invoice fields if provided
+            if (isset($validated['invoice_status'])) {
+                $invoice->invoice_status = $validated['invoice_status'];
+            }
+            
+            if (isset($validated['due_date'])) {
+                $invoice->due_date = $validated['due_date'];
+            }
+            
+            if (isset($validated['customer_id'])) {
+                $invoice->customer_id = $validated['customer_id'];
+            }
+            
+            $invoice->save();
+
+            return response()->json($invoice->load(['customer', 'items.product', 'payments']));
+        });
+    } else {
+        // Simple update without changing items
         $invoice->update($validated);
         return response()->json($invoice);
     }
+}
 
     public function destroy(Invoice $invoice): JsonResponse
     {
